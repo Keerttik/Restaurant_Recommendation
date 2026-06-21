@@ -42,7 +42,6 @@ MANIFEST
 # Ignore large datasets and databases
 data/*.csv
 data/*.json
-data/*.db
 data/*.db-shm
 data/*.db-wal
 src/db/*.db
