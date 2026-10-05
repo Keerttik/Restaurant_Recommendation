@@ -24,6 +24,52 @@ class AIRecommendationItem(BaseModel):
 class AIRecommendationResponse(BaseModel):
     recommendations: list[AIRecommendationItem] = Field(..., description="List of top recommended restaurants.")
 
+PREFERRED_GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+]
+
+def resolve_candidate_models(client: Groq, requested_model: str | None) -> list[str]:
+    """
+    Returns an ordered list of candidate models to try.
+    Checks actual models available on the Groq account dynamically.
+    """
+    try:
+        available = {m.id for m in client.models.list().data}
+    except Exception as e:
+        print(f"Warning: Could not fetch Groq models list ({e})")
+        available = set()
+
+    candidates: list[str] = []
+
+    # If user explicitly requested a model (that is not an OpenAI proprietary model like gpt-4o),
+    # and it exists in available models (or available check failed), prioritize it.
+    if requested_model and not requested_model.lower().startswith("gpt-4"):
+        if not available or requested_model in available:
+            candidates.append(requested_model)
+
+    # Next add models from preferred list that are actually available
+    for m in PREFERRED_GROQ_MODELS:
+        if (not available or m in available) and m not in candidates:
+            candidates.append(m)
+
+    # If still empty or no preferred models available, add any text-generation models
+    if available:
+        for m in sorted(available):
+            m_lower = m.lower()
+            if not any(x in m_lower for x in ["whisper", "guard", "orpheus"]) and m not in candidates:
+                candidates.append(m)
+
+    if not candidates:
+        candidates = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]
+
+    return candidates
+
 def get_groq_client():
     """Initializes and returns a Groq Client if API key is present."""
     if not config.LLM_API_KEY or config.LLM_API_KEY == "your_llm_api_key_here":
@@ -39,15 +85,8 @@ def generate_personalized_recommendations(user_prefs, candidate_restaurants):
         return {"recommendations": []}
 
     client = get_groq_client()
-    
-    # Smart Fallback / Model Override:
-    # If the user has a Groq key (gsk_...) but configures an OpenAI model (gpt-4o-mini),
-    # map it to a valid, high-performance Groq model to prevent API errors.
-    model_to_use = config.LLM_MODEL
-    if config.LLM_API_KEY.startswith("gsk_") and "gpt" in model_to_use.lower():
-        # Fall back to Llama 3.3 70B on Groq
-        model_to_use = "llama-3.3-70b-versatile"
-        print(f"Groq override: Mapping unsupported model '{config.LLM_MODEL}' to '{model_to_use}'")
+    models_to_try = resolve_candidate_models(client, config.LLM_MODEL)
+    print(f"Candidate Groq models to try: {models_to_try}")
 
     # 1. Format candidate list
     candidates_formatted = []
@@ -114,27 +153,40 @@ You MUST return a JSON object adhering exactly to this JSON schema:
 {json.dumps(json_schema_format, indent=2)}
 """
 
-    # 4. Invoke Groq completion in JSON mode
-    try:
-        completion = client.chat.completions.create(
-            model=model_to_use,
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2
-        )
-        
-        # Load and parse output string
-        raw_text = completion.choices[0].message.content
-        result_json = json.loads(raw_text)
-        
-        # Validate schema using Pydantic model dump/load check
-        AIRecommendationResponse(**result_json)
-        
-        return result_json
-        
-    except Exception as e:
-        print(f"Error calling Groq API: {e}")
-        raise e
+    # 4. Invoke Groq completion in JSON mode with fallback across candidate models
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            print(f"Calling Groq completion using model '{model_name}'...")
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.2
+            )
+
+            # Load and parse output string
+            raw_text = completion.choices[0].message.content
+            result_json = json.loads(raw_text)
+
+            # Validate schema using Pydantic model dump/load check
+            AIRecommendationResponse(**result_json)
+
+            return result_json
+
+        except Exception as e:
+            err_str = str(e).lower()
+            last_error = e
+            # If model is not found (404 / model_not_found) or unavailable, try next candidate
+            if "not_found" in err_str or "does not exist" in err_str or "404" in err_str:
+                print(f"Model '{model_name}' unavailable on Groq: {e}. Trying next candidate model...")
+                continue
+            print(f"Error calling Groq API with model '{model_name}': {e}")
+            raise e
+
+    if last_error:
+        print(f"All candidate Groq models failed. Last error: {last_error}")
+        raise last_error
